@@ -389,12 +389,44 @@ CFR_MODE = "CFR_PLUS"  # options: CFR_PLUS, LCFR, DCFR
 CFR_ALPHA = 0.5  # exponent for DCFR weighting
 PA_ABS = False  # potential-aware abstraction toggle
 
+# Enhanced resolve controls
+RESOLVE_DETERMS = 0           # number of public-belief determinizations (0/1 disables)
+RESOLVE_WARMSTART_WEIGHT = 0  # how strongly to warm-start from blueprint at root
+HOLE_EVAL_SAMPLES = 0         # Monte Carlo samples for hole bucket estimation (0 disables)
+KL_ALPHA = 0.0                # blend weight with blueprint prior at resolver root (0 disables)
+RESOLVE_PARALLEL = False      # parallelize determinizations at resolve
+POSTERIOR_FROM_BLUEPRINT = False  # sample opponents' holes using blueprint posterior at public state
+
 def set_resolve_params(iters: int = None, depth: int = None):
     global RESOLVE_ITERS, RESOLVE_DEPTH
     if iters is not None:
         RESOLVE_ITERS = max(1, int(iters))
     if depth is not None:
         RESOLVE_DEPTH = max(1, int(depth))
+
+def set_resolve_enhancements(determs: Optional[int] = None, warmstart: Optional[int] = None, hole_eval_samples: Optional[int] = None):
+    global RESOLVE_DETERMS, RESOLVE_WARMSTART_WEIGHT, HOLE_EVAL_SAMPLES
+    if determs is not None:
+        RESOLVE_DETERMS = max(0, int(determs))
+    if warmstart is not None:
+        RESOLVE_WARMSTART_WEIGHT = max(0, int(warmstart))
+    if hole_eval_samples is not None:
+        HOLE_EVAL_SAMPLES = max(0, int(hole_eval_samples))
+
+def set_resolve_regularization(kl_alpha: Optional[float] = None):
+    global KL_ALPHA
+    if kl_alpha is not None:
+        try:
+            KL_ALPHA = float(max(0.0, min(1.0, kl_alpha)))
+        except Exception:
+            KL_ALPHA = 0.0
+
+def set_resolve_modes(parallel: Optional[bool] = None, posterior_from_blueprint: Optional[bool] = None):
+    global RESOLVE_PARALLEL, POSTERIOR_FROM_BLUEPRINT
+    if parallel is not None:
+        RESOLVE_PARALLEL = bool(parallel)
+    if posterior_from_blueprint is not None:
+        POSTERIOR_FROM_BLUEPRINT = bool(posterior_from_blueprint)
 
 def _board_texture_bucket(s) -> int:
     b = s["board"]
@@ -425,10 +457,35 @@ def _hole_bucket(s, player:int) -> int:
         ctrs = HOLE_CENTROIDS
         dists = ((ctrs - vec)**2).sum(axis=1)
         return int(np.argmin(dists))
-    # Use treys rank on current board if any; otherwise hand class
+    # Optionally estimate strength by Monte Carlo vs random opponent completion
     me = s["players"][player]
     if len(me["hole"]) < 2:
         return 0
+    if HOLE_EVAL_SAMPLES and HOLE_EVAL_SAMPLES > 0:
+        try:
+            rng = random.Random(1234)
+            known = set(s["board"]) | set(me["hole"]) | set()
+            deck = [c for c in range(52) if c not in known]
+            wins = 0; ties = 0; total = 0
+            need_board = max(0, 5 - len(s["board"]))
+            for _ in range(HOLE_EVAL_SAMPLES):
+                rng.shuffle(deck)
+                # sample villain hand
+                if len(deck) < 2 + need_board: break
+                v0, v1 = deck[0], deck[1]
+                rem_board = deck[2:2+need_board]
+                b = board_to_treys(s["board"] + rem_board)
+                my_rank = EVAL.evaluate(b, hand_to_treys(me["hole"]))
+                vil_rank = EVAL.evaluate(b, hand_to_treys([v0, v1]))
+                if my_rank < vil_rank: wins += 1
+                elif my_rank == vil_rank: ties += 1
+                total += 1
+            if total > 0:
+                winprob = (wins + 0.5 * ties) / total
+                return int(max(0, min(1, winprob)) * 99)
+        except Exception:
+            pass
+    # Fallback: single treys score
     try:
         b = board_to_treys(s["board"]) if s["board"] else []
         h = hand_to_treys(me["hole"])
@@ -471,14 +528,29 @@ def build_abstraction_from_dataset(data_path: str, hole_k: int = 256, board_k: i
     board = X[:, 6:58]
     hole = X[:, 58:110]
     if PA_ABS:
-        # Potential-aware tweak: include simple pair/flush/straight potentials in board vectors
-        # by concatenating coarse texture codes to board features
-        tex = []
+        # Add simple potential-aware descriptors derived from board mask
+        # Features: [paired_flag, max_suit_count>=3, connectivity_count/3]
+        tex = np.zeros((board.shape[0], 3), dtype=np.float32)
         for i in range(board.shape[0]):
-            # crude proxy from existing bucket code
-            # here use board features directly; leave as zeros if not enough info
-            tex.append([0,0,0])
-        tex = np.asarray(tex, dtype=np.float32)
+            cards = np.nonzero(board[i] > 0.5)[0]
+            if cards.size == 0:
+                continue
+            ranks = sorted([(int(c) % 13) for c in cards])
+            suits = [(int(c) // 13) for c in cards]
+            paired = 1.0 if any(ranks.count(r) >= 2 for r in set(ranks)) else 0.0
+            max_suit = 0
+            if suits:
+                for su in set(suits):
+                    max_suit = max(max_suit, suits.count(su))
+            flushish = 1.0 if max_suit >= 3 else 0.0
+            conn = 0
+            if len(ranks) >= 2:
+                for j in range(len(ranks)-1):
+                    if abs(ranks[j+1] - ranks[j]) <= 2:
+                        conn += 1
+            tex[i, 0] = paired
+            tex[i, 1] = flushish
+            tex[i, 2] = min(3.0, float(conn)) / 3.0
         board = np.concatenate([board, tex], axis=1)
     print(f"KMeans hole={hole_k} board={board_k} on {X.shape[0]} samples")
     hole_centroids = _kmeans(hole, hole_k, iters=iters)
@@ -748,9 +820,10 @@ def external_sampling(tab, s, target:int, reach_i:float, reach_opp:float, depth:
         acts = list(legal)
         if not acts:
             return rollout_value(s, target, value_fn=value_fn)
+        # Public Chance Sampling variant: reweight by simple baseline to reduce variance
         probs = [max(float(sigma.get(a, 0.0)), 0.0) for a in acts]
-        total_w = sum(probs)
-        if total_w <= 1e-12:
+        z = sum(probs)
+        if z <= 1e-12:
             probs = [1.0/len(acts)] * len(acts)
         a = random.choices(acts, weights=probs, k=1)[0]
         nxt = step(s, a)
@@ -761,26 +834,183 @@ def mccfr_train_iteration(tab, root, value_fn=None, depth_limit=None, iteration:
     for p in range(root["num_players"]):
         external_sampling(tab, root, p, 1.0, 1.0, 0, value_fn, depth_limit, iteration, linear_weighting)
 
-def depth_limited_resolve(root, value_fn, cfr_iters:int=200, depth_limit:int=3):
+def depth_limited_resolve(root, value_fn, cfr_iters:int=200, depth_limit:int=3, blueprint:Optional[Dict]=None):
     # Respect caller values; do not override upwards to global caps during strict eval
     cfr_iters = int(max(1, cfr_iters))
     depth_limit = int(max(1, depth_limit))
-    # Small cache by public state key + to_act
+
+    def _warmstart_from_blueprint(tab, s):
+        if not blueprint or RESOLVE_WARMSTART_WEIGHT <= 0:
+            return
+        legal = legal_actions(s)
+        if not legal:
+            return
+        infoset = info_key(s, s["to_act"]) if not USE_ABSTRACTION else abstraction_key(s, s["to_act"])  # consistent key
+        if infoset in blueprint:
+            options = []
+            probs = []
+            for k, v in blueprint[infoset].items():
+                ks = k.replace('[', '(').replace(']', ')').replace('"', '').replace("'", '')
+                if ks.startswith("(R,"):
+                    num = ''.join(ch for ch in ks if ch.isdigit())
+                    a = ('R', int(num))
+                elif ks.startswith("(C"):
+                    a = ('C',)
+                elif ks.startswith("(X"):
+                    a = ('X',)
+                elif ks.startswith("(F"):
+                    a = ('F',)
+                else:
+                    continue
+                if a in legal:
+                    options.append(a); probs.append(float(v))
+            z = sum(probs)
+            if z > 0 and options:
+                sig = {a: (p / z) for a, p in zip(options, probs)}
+                # seed strategy_sum at root
+                rt_add_strategy(tab, info_key(s, s["to_act"]), sig, weight=float(RESOLVE_WARMSTART_WEIGHT), iteration=1)
+
+    def _resolve_once(state, iters:int) -> Dict[Tuple, float]:
+        tab = {"regret": defaultdict(lambda: defaultdict(float)),
+               "strategy_sum": defaultdict(lambda: defaultdict(float))}
+        _warmstart_from_blueprint(tab, state)
+        for it in range(1, iters+1):
+            mccfr_train_iteration(tab, state, value_fn=value_fn, depth_limit=depth_limit, iteration=it, linear_weighting=True)
+        infoset = info_key(state, state["to_act"])
+        legal = legal_actions(state)
+        base = rt_avg_strategy(tab, infoset, legal) if legal else {}
+        if legal and blueprint and KL_ALPHA and KL_ALPHA > 0.0:
+            # Blend with blueprint prior at root (simple convex combination)
+            prior = {}
+            bp_key = infoset if not USE_ABSTRACTION else abstraction_key(state, state["to_act"])  # consistent lookup
+            if bp_key in blueprint:
+                for k, v in blueprint[bp_key].items():
+                    ks = k.replace('[', '(').replace(']', ')').replace('"', '').replace("'", '')
+                    if ks.startswith("(R,"):
+                        num = ''.join(ch for ch in ks if ch.isdigit()); a = ('R', int(num))
+                    elif ks.startswith("(C"):
+                        a = ('C',)
+                    elif ks.startswith("(X"):
+                        a = ('X',)
+                    elif ks.startswith("(F"):
+                        a = ('F',)
+                    else:
+                        continue
+                    if a in legal:
+                        prior[a] = prior.get(a, 0.0) + float(v)
+                z = sum(prior.values())
+                if z > 0:
+                    for a in list(prior.keys()):
+                        prior[a] /= z
+            if prior:
+                # linear blend: sigma = (1-KL_ALPHA)*base + KL_ALPHA*prior (renormalize to legal)
+                out = {}
+                for a in legal:
+                    out[a] = (1.0 - KL_ALPHA) * float(base.get(a, 0.0)) + KL_ALPHA * float(prior.get(a, 0.0))
+                z2 = sum(out.values())
+                if z2 > 0:
+                    for a in list(out.keys()):
+                        out[a] /= z2
+                return out
+        return base
+
+    # Small cache by public state key + to_act + determ params
     global RESOLVE_CACHE
-    key = (public_state_key(root), root["to_act"], cfr_iters, depth_limit)
+    key = (public_state_key(root), root["to_act"], cfr_iters, depth_limit, int(bool(blueprint)), RESOLVE_DETERMS, RESOLVE_WARMSTART_WEIGHT)
     if key in RESOLVE_CACHE:
         return RESOLVE_CACHE[key]
-    tab = {"regret": defaultdict(lambda: defaultdict(float)),
-           "strategy_sum": defaultdict(lambda: defaultdict(float))}
-    for it in range(1, cfr_iters+1):
-        mccfr_train_iteration(tab, root, value_fn=value_fn, depth_limit=depth_limit, iteration=it, linear_weighting=True)
-    infoset = info_key(root, root["to_act"])
-    legal = legal_actions(root)
-    strat = rt_avg_strategy(tab, infoset, legal)
+
+    # Determinization loop (public belief)
+    if RESOLVE_DETERMS and RESOLVE_DETERMS > 1:
+        agg: Dict[Tuple, float] = {}
+        per_iter = max(1, cfr_iters // RESOLVE_DETERMS)
+        if RESOLVE_PARALLEL and RESOLVE_DETERMS >= 2:
+            from multiprocessing import get_context
+            ctx = get_context("spawn")
+            def _job(_):
+                ds = _sample_determinization(root, root["to_act"], blueprint)
+                return _resolve_once(ds, per_iter)
+            with ctx.Pool(processes=min(RESOLVE_DETERMS, max(1, os.cpu_count() or 1))) as pool:
+                for strat in pool.map(_job, list(range(RESOLVE_DETERMS))):
+                    for a, p in strat.items():
+                        agg[a] = agg.get(a, 0.0) + float(p)
+        else:
+            for _ in range(RESOLVE_DETERMS):
+                ds = _sample_determinization(root, root["to_act"], blueprint)
+                strat = _resolve_once(ds, per_iter)
+                for a, p in strat.items():
+                    agg[a] = agg.get(a, 0.0) + float(p)
+        z = sum(agg.values())
+        strat = {a: (v / z) for a, v in agg.items()} if z > 0 else {}
+    else:
+        strat = _resolve_once(root, cfr_iters)
+
     if len(RESOLVE_CACHE) > RESOLVE_CACHE_MAX:
         RESOLVE_CACHE.clear()
     RESOLVE_CACHE[key] = strat
     return strat
+
+def _sample_determinization(s, me_idx:int, blueprint: Optional[Dict]=None):
+    # Clone state and fill unknown opponents' hole cards.
+    # If POSTERIOR_FROM_BLUEPRINT: bias sampling by blueprint posterior given public state; else uniform.
+    ss = clone_state(s)
+    public_key = public_state_key(ss)
+    # Build remaining deck
+    known = set(ss["board"]) | set(ss["players"][me_idx]["hole"]) | set()
+    for i, p in enumerate(ss["players"]):
+        if i == me_idx:
+            continue
+        for c in p.get("hole", []):
+            known.add(c)
+    remaining = [c for c in range(52) if c not in known]
+    random.shuffle(remaining)
+
+    # Helper: posterior over pairs (c1,c2) for a seat
+    def _posterior_pairs_for_seat(seat:int) -> List[Tuple[int,int,float]]:
+        # Uniform fallback
+        pairs = []
+        m = {}
+        n = len(remaining)
+        # Very light blueprint-based posterior: prefer strong hole buckets on current board
+        if not POSTERIOR_FROM_BLUEPRINT or not blueprint:
+            for i in range(n):
+                for j in range(i+1, n):
+                    pairs.append((remaining[i], remaining[j], 1.0))
+            return pairs
+        # Score by treys rank on current board
+        try:
+            b = board_to_treys(ss["board"]) if ss["board"] else []
+            for i in range(n):
+                for j in range(i+1, n):
+                    h = hand_to_treys([remaining[i], remaining[j]])
+                    score = EVAL.evaluate(b, h)
+                    strength = (7462 - score) / 7462.0
+                    pairs.append((remaining[i], remaining[j], 0.2 + 0.8*strength))
+        except Exception:
+            for i in range(n):
+                for j in range(i+1, n):
+                    pairs.append((remaining[i], remaining[j], 1.0))
+        return pairs
+
+    # Assign to opponents sequentially without overlap
+    used = set()
+    for i, p in enumerate(ss["players"]):
+        if i == me_idx or p.get("folded", False):
+            continue
+        if len(p.get("hole", [])) >= 2:
+            continue
+        cand = _posterior_pairs_for_seat(i)
+        # Filter out already used or conflicting cards
+        cand = [(c1, c2, w) for (c1, c2, w) in cand if (c1 not in used) and (c2 not in used)]
+        if not cand:
+            continue
+        # Sample pair by weights
+        weights = [w for (_, _, w) in cand]
+        k = random.choices(range(len(cand)), weights=weights, k=1)[0]
+        c1, c2, _ = cand[k]
+        p.setdefault("hole", []).extend([c1, c2])
+        used.add(c1); used.add(c2)
+    return ss
 
 # -------- Data / Scripts --------
 def rollout_return(s, player:int) -> float:
@@ -815,6 +1045,39 @@ def cmd_selfplay_generate(args):
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     np.savez(args.out, x=xs, y=ys)
     print(f"Saved self-play dataset to {args.out}  x{xs.shape} y{ys.shape}")
+
+def cmd_generate_cfv(args):
+    # Generate counterfactual value targets using strict BR gap on sampled states
+    set_bet_sizes(args.bet_sizes_preflop, args.bet_sizes_postflop)
+    bp = load_blueprint(args.blueprint) if args.blueprint else {}
+    if args.value and os.path.exists(args.value):
+        value_fn = make_value_fn_from_dp(args.value) if args.value.endswith('.pt') else make_value_fn(load_value_params(args.value))
+    else:
+        value_fn = (lambda s, p: 0.0)
+    set_resolve_enhancements(getattr(args, 'resolve_determs', None), getattr(args, 'resolve_warmstart', None), getattr(args, 'hole_eval_samples', None))
+    set_resolve_regularization(getattr(args, 'kl_alpha', None))
+    X = []
+    Y = []
+    for _ in trange(args.samples, desc="CFV-generate"):
+        s = _sample_state(args.num_players)
+        player = random.randrange(args.num_players)
+        try:
+            memo = {}
+            br = _br_value(s, player, bp, value_fn, max(RESOLVE_ITERS, args.resolve_iters), max(RESOLVE_DEPTH, args.resolve_depth), args.depth_cap, memo)
+            sv = _sigma_value(s, player, bp, value_fn, max(RESOLVE_ITERS, args.resolve_iters), max(RESOLVE_DEPTH, args.resolve_depth), args.depth_cap, memo)
+            gap = max(0.0, br - sv)
+            X.append(encode_features(s, player))
+            Y.append(gap)
+        except Exception:
+            continue
+    if X:
+        Xn = np.stack(X, axis=0)
+        Yn = np.asarray(Y, dtype=np.float32)
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        np.savez(args.out, x=Xn, y=Yn)
+        print(f"Saved CFV dataset to {args.out}  x{Xn.shape} y{Yn.shape}")
+    else:
+        print("No CFV samples generated.")
 
 def cmd_train_value(args):
     train_value(args.data, save_path=args.save, epochs=args.epochs, batch=args.batch, lr=args.lr)
@@ -888,6 +1151,8 @@ def _worker_mccfr(args_tuple):
 
 def cmd_train_blueprint_dist(args):
     set_bet_sizes(args.bet_sizes_preflop, args.bet_sizes_postflop)
+    # Apply resolve enhancements globally for periodic h2h/eval
+    set_resolve_enhancements(getattr(args, 'resolve_determs', None), getattr(args, 'resolve_warmstart', None), getattr(args, 'hole_eval_samples', None))
     world = max(1, int(args.num_workers))
     total_iters = int(args.iterations)
     chunk = int(args.chunk) if args.chunk else max(1, total_iters // world)
@@ -898,6 +1163,8 @@ def cmd_train_blueprint_dist(args):
     use_abs = bool(args.use_abstraction)
     dyn_abs = bool(args.dynamic_abstraction)
     print(f"[bold green]Distributed MCCFR[/bold green]: workers={world} total_iters={total_iters} chunk={chunk}")
+    # Allow toggling posterior-based determinization and parallel resolve via CLI
+    set_resolve_modes(getattr(args, 'resolve_parallel', None), getattr(args, 'posterior_from_blueprint', None))
     merged = {}
     done = 0
     def _quick_eval_path(bp_path:str):
@@ -1034,7 +1301,7 @@ def choose_bot_action(s, blueprint:Dict, value_fn, resolve_iters:int=None, resol
     st = stage(s)
     it = resolve_iters if resolve_iters is not None else (200 if st=='preflop' else 400)
     dp = resolve_depth if resolve_depth is not None else (3 if st=='preflop' else 4)
-    strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=it, depth_limit=dp)
+    strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=it, depth_limit=dp, blueprint=blueprint)
     if strat:
         acts=list(strat.keys()); probs=[strat[a] for a in acts]
         return random.choices(acts, weights=probs, k=1)[0]
@@ -1181,6 +1448,10 @@ def cmd_evaluate(args):
         bfn = _baseline_random_action
     btn = 0
     winnings = []
+    # Apply resolve enhancements if provided
+    set_resolve_enhancements(getattr(args, 'resolve_determs', None), getattr(args, 'resolve_warmstart', None), getattr(args, 'hole_eval_samples', None))
+    set_resolve_regularization(getattr(args, 'kl_alpha', None))
+
     for _ in trange(args.hands, desc=f"Evaluate vs {baseline}"):
         res, btn = _play_hand(bp, value_fn, bfn, num_players=args.num_players, btn=btn)
         winnings.append(res[0])
@@ -1348,9 +1619,9 @@ def _sigma_from_blueprint_or_resolve(s, blueprint: Dict, value_fn, cfr_iters: in
     legal = legal_actions(s)
     if not legal:
         return {}
-    # Try online resolve first
+    # Try online resolve first (with blueprint warm-start if available)
     try:
-        strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=cfr_iters, depth_limit=depth_limit)
+        strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=cfr_iters, depth_limit=depth_limit, blueprint=blueprint)
         if strat:
             # Filter to legal and renormalize
             acts = {a: p for a, p in strat.items() if a in legal and p > 0}
@@ -1503,6 +1774,96 @@ def cmd_exploitability_strict(args):
         "depth_cap": depth_cap
     }, indent=2))
 
+def cmd_auto_pluribus(args):
+    # One-command end-to-end pipeline with strong defaults
+    from types import SimpleNamespace as NS
+    base = "/Users/faust/PycharmProjects/p1"
+    os.makedirs(f"{base}/data", exist_ok=True)
+    os.makedirs(f"{base}/ckpts", exist_ok=True)
+    # 1) Self-play dataset
+    sp_args = NS(
+        episodes=int(args.episodes),
+        out=f"{base}/data/selfplay_big.npz",
+        seed=123,
+        num_players=6,
+        bet_sizes_preflop=None,
+        bet_sizes_postflop=None
+    )
+    cmd_selfplay_generate(sp_args)
+    # 2) Abstraction (potential-aware)
+    global PA_ABS
+    PA_ABS = True
+    build_abstraction_from_dataset(
+        data_path=sp_args.out,
+        hole_k=int(args.hole_k),
+        board_k=int(args.board_k),
+        iters=int(args.abs_iters),
+        save=f"{base}/abs_big.npz",
+    )
+    # 3) Value net (distributed)
+    train_value_distributed(
+        data_path=sp_args.out,
+        save_path=f"{base}/value_dp.pt",
+        epochs=int(args.value_epochs),
+        batch=int(args.value_batch),
+        lr=float(args.value_lr),
+    )
+    # 4) Distributed MCCFR with periodic monitoring and optional H2H vs previous blueprint
+    tb_args = NS(
+        iterations=int(args.iterations),
+        num_players=6,
+        num_workers=int(args.num_workers),
+        save=f"{base}/blueprint_dist.json",
+        save_sum=f"{base}/blueprint_sums.json",
+        bet_sizes_preflop=None,
+        bet_sizes_postflop=None,
+        abstraction=f"{base}/abs_big.npz",
+        use_abstraction=True,
+        dynamic_abstraction=True,
+        chunk=max(1, int(args.iterations)//max(1,int(args.num_workers))),
+        checkpoint_dir=f"{base}/ckpts",
+        eval_every_chunk=True,
+        eval_hands=int(args.eval_hands),
+        eval_num_players=6,
+        eval_baseline="random",
+        eval_value=f"{base}/value_dp.pt",
+        eval_abstraction=f"{base}/abs_big.npz",
+        h2h_every_chunk=bool(args.prev_blueprint is not None),
+        h2h_blueprint=args.prev_blueprint,
+        h2h_hands=int(args.h2h_hands),
+        h2h_resolve_iters=int(args.h2h_resolve_iters),
+        h2h_resolve_depth=int(args.h2h_resolve_depth),
+        resolve_determs=int(args.resolve_determs),
+        resolve_warmstart=int(args.resolve_warmstart),
+        hole_eval_samples=int(args.hole_eval_samples),
+        kl_alpha=float(args.kl_alpha),
+        resolve_parallel=True,
+        posterior_from_blueprint=True,
+    )
+    cmd_train_blueprint_dist(tb_args)
+    # 5) Final evaluations
+    ev_common = dict(
+        blueprint=tb_args.save,
+        value=f"{base}/value_dp.pt",
+        abstraction=f"{base}/abs_big.npz",
+        hands=int(args.final_hands),
+        num_players=6,
+        resolve_iters=int(args.final_resolve_iters),
+        resolve_depth=int(args.final_resolve_depth),
+        use_abstraction=True,
+        dynamic_abstraction=True,
+        resolve_determs=int(args.resolve_determs),
+        resolve_warmstart=int(args.resolve_warmstart),
+        hole_eval_samples=int(args.hole_eval_samples),
+        kl_alpha=float(args.kl_alpha),
+    )
+    # vs random
+    cmd_evaluate(NS(baseline="random", bet_sizes_preflop=None, bet_sizes_postflop=None, **ev_common))
+    # vs tight
+    cmd_evaluate(NS(baseline="tight", bet_sizes_preflop=None, bet_sizes_postflop=None, **ev_common))
+    # exploitability
+    cmd_exploitability_strict(NS(blueprint=tb_args.save, value=f"{base}/value_dp.pt", samples=int(args.expl_samples), num_players=6, depth_cap=int(args.expl_depth_cap), resolve_iters=int(args.final_resolve_iters), resolve_depth=int(args.final_resolve_depth)))
+
 def parse_action_str(a_str):
     a_str = a_str.strip().lower()
     if a_str in ['f','fold']: return ('F',)
@@ -1587,7 +1948,11 @@ def cmd_resolve_from_json(args):
         value_fn = make_value_fn(params)
     else:
         value_fn = lambda st,pl: 0.0
-    strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=max(args.cfr_iters, RESOLVE_ITERS), depth_limit=max(args.depth, RESOLVE_DEPTH))
+    # Apply resolve enhancements if provided
+    set_resolve_enhancements(getattr(args, 'resolve_determs', None), getattr(args, 'resolve_warmstart', None), getattr(args, 'hole_eval_samples', None))
+    set_resolve_regularization(getattr(args, 'kl_alpha', None))
+    bp_json = load_blueprint(args.blueprint) if args.blueprint else None
+    strat = depth_limited_resolve(s, value_fn=value_fn, cfr_iters=max(args.cfr_iters, RESOLVE_ITERS), depth_limit=max(args.depth, RESOLVE_DEPTH), blueprint=bp_json)
     if args.blueprint and not strat:
         bp = load_blueprint(args.blueprint)
         infoset = f"{public_state_key(s)}|priv:{private_obs(s, s['to_act'])}|p:{s['to_act']}"
@@ -1609,6 +1974,24 @@ def main():
     a.add_argument("--bet-sizes-preflop", type=str, default=None)
     a.add_argument("--bet-sizes-postflop", type=str, default=None)
     a.set_defaults(func=cmd_selfplay_generate)
+
+    # generate_cfv
+    a = sp.add_parser("generate_cfv")
+    a.add_argument("--samples", type=int, default=50000)
+    a.add_argument("--num-players", type=int, default=6)
+    a.add_argument("--blueprint", type=str, default=None)
+    a.add_argument("--value", type=str, default=None)
+    a.add_argument("--resolve-iters", type=int, default=1000)
+    a.add_argument("--resolve-depth", type=int, default=5)
+    a.add_argument("--depth-cap", type=int, default=5)
+    a.add_argument("--bet-sizes-preflop", type=str, default=None)
+    a.add_argument("--bet-sizes-postflop", type=str, default=None)
+    a.add_argument("--resolve-determs", type=int, default=None)
+    a.add_argument("--resolve-warmstart", type=int, default=None)
+    a.add_argument("--hole-eval-samples", type=int, default=None)
+    a.add_argument("--kl-alpha", type=float, default=None)
+    a.add_argument("--out", type=str, default="data/cfv.npz")
+    a.set_defaults(func=cmd_generate_cfv)
 
     # train_value
     a = sp.add_parser("train_value")
@@ -1670,6 +2053,12 @@ def main():
     a.add_argument("--h2h-hands", type=int, default=1000)
     a.add_argument("--h2h-resolve-iters", type=int, default=None)
     a.add_argument("--h2h-resolve-depth", type=int, default=None)
+    a.add_argument("--resolve-determs", type=int, default=None)
+    a.add_argument("--resolve-warmstart", type=int, default=None)
+    a.add_argument("--hole-eval-samples", type=int, default=None)
+    a.add_argument("--kl-alpha", type=float, default=None)
+    a.add_argument("--resolve-parallel", action="store_true")
+    a.add_argument("--posterior-from-blueprint", action="store_true")
     a.set_defaults(func=cmd_train_blueprint_dist)
 
     # merge
@@ -1704,6 +2093,10 @@ def main():
     a.add_argument("--bet-sizes-postflop", type=str, default=None)
     a.add_argument("--resolve-iters", type=int, default=None)
     a.add_argument("--resolve-depth", type=int, default=None)
+    a.add_argument("--resolve-determs", type=int, default=None)
+    a.add_argument("--resolve-warmstart", type=int, default=None)
+    a.add_argument("--hole-eval-samples", type=int, default=None)
+    a.add_argument("--kl-alpha", type=float, default=None)
     a.add_argument("--use-abstraction", action="store_true")
     a.add_argument("--dynamic-abstraction", action="store_true")
     a.set_defaults(func=cmd_evaluate)
@@ -1745,6 +2138,10 @@ def main():
     a.add_argument("--depth", type=int, default=3)
     a.add_argument("--bet-sizes-preflop", type=str, default=None)
     a.add_argument("--bet-sizes-postflop", type=str, default=None)
+    a.add_argument("--resolve-determs", type=int, default=None)
+    a.add_argument("--resolve-warmstart", type=int, default=None)
+    a.add_argument("--hole-eval-samples", type=int, default=None)
+    a.add_argument("--kl-alpha", type=float, default=None)
     a.set_defaults(func=cmd_resolve_from_json)
 
     # abstraction build/load
@@ -1764,6 +2161,33 @@ def main():
     a = sp.add_parser("load_abstraction")
     a.add_argument("--path", type=str, required=True)
     a.set_defaults(func=lambda args: load_abstraction(args.path))
+
+    # auto_pluribus: one-command end-to-end pipeline
+    a = sp.add_parser("auto_pluribus")
+    a.add_argument("--episodes", type=int, default=3000000)
+    a.add_argument("--hole-k", type=int, default=1024)
+    a.add_argument("--board-k", type=int, default=512)
+    a.add_argument("--abs-iters", type=int, default=30)
+    a.add_argument("--value-epochs", type=int, default=30)
+    a.add_argument("--value-batch", type=int, default=16384)
+    a.add_argument("--value-lr", type=float, default=3e-4)
+    a.add_argument("--iterations", type=int, default=2000000)
+    a.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() or 1))
+    a.add_argument("--eval-hands", type=int, default=2000)
+    a.add_argument("--h2h-hands", type=int, default=1000)
+    a.add_argument("--h2h-resolve-iters", type=int, default=600)
+    a.add_argument("--h2h-resolve-depth", type=int, default=5)
+    a.add_argument("--resolve-determs", type=int, default=8)
+    a.add_argument("--resolve-warmstart", type=int, default=50)
+    a.add_argument("--hole-eval-samples", type=int, default=2000)
+    a.add_argument("--kl-alpha", type=float, default=0.2)
+    a.add_argument("--final-hands", type=int, default=20000)
+    a.add_argument("--final-resolve-iters", type=int, default=800)
+    a.add_argument("--final-resolve-depth", type=int, default=5)
+    a.add_argument("--expl-samples", type=int, default=50000)
+    a.add_argument("--expl-depth-cap", type=int, default=6)
+    a.add_argument("--prev-blueprint", type=str, default=None)
+    a.set_defaults(func=cmd_auto_pluribus)
 
     args = p.parse_args()
     random.seed(42)
